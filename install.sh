@@ -431,15 +431,12 @@ echo -e "  ${BOLD}sudo certbot --apache -d ${DOMAIN}${NC}"
 # =============================================================================
 section "Installing Webmin"
 
-curl -fsSL https://download.webmin.com/jcameron-key.asc \
-  | gpg --dearmor -o /usr/share/keyrings/webmin-keyring.gpg
+curl -o webmin-setup-repo.sh https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh
+sudo sh webmin-setup-repo.sh
 
-echo "deb [signed-by=/usr/share/keyrings/webmin-keyring.gpg] \
-https://download.webmin.com/download/repository sarge contrib" \
-  > /etc/apt/sources.list.d/webmin.list
 
 apt-get update -qq
-apt-get install -y -qq webmin
+apt-get install -y -qq webmin usermin
 
 success "Webmin installed — accessible at https://$(hostname -I | awk '{print $1}'):10000"
 
