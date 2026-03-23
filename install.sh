@@ -418,7 +418,9 @@ success "VirtualHost created at /etc/apache2/sites-available/${DOMAIN}.conf"
 section "Installing Certbot"
 
 snap install --classic certbot
-ln -s /snap/bin/certbot /usr/local/bin/certbot
+if [[ ! -e /usr/local/bin/certbot ]]; then
+  ln -s /snap/bin/certbot /usr/local/bin/certbot
+fi
 success "Certbot installed"
 info "To enable SSL later, run:"
 echo -e "  ${BOLD}sudo certbot --apache -d ${DOMAIN}${NC}"
