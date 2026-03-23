@@ -359,17 +359,13 @@ success "Redis installed and configured (maxmemory: ${REDIS_MAX})"
 # =============================================================================
 section "Creating VirtualHost for ${DOMAIN}"
 
-# Create document root
-mkdir -p "${DOC_ROOT}"
-chown -R www-data:www-data "${DOC_ROOT}"
-chmod 750 "${DOC_ROOT}"
+# Only create doc root and set permissions if it doesn't exist
+if [[ ! -d "${DOC_ROOT}" ]]; then
+  mkdir -p "${DOC_ROOT}"
+  chown -R www-data:www-data "${DOC_ROOT}"
+  chmod 750 "${DOC_ROOT}" 
+fi
 
-# Create a default index.php
-cat > "${DOC_ROOT}/index.php" <<EOF
-<?php
-phpinfo();
-EOF
-chown www-data:www-data "${DOC_ROOT}/index.php"
 
 # Write VirtualHost — port 80, no SSL (certbot later)
 cat > "/etc/apache2/sites-available/${DOMAIN}.conf" <<EOF
@@ -421,7 +417,8 @@ success "VirtualHost created at /etc/apache2/sites-available/${DOMAIN}.conf"
 # =============================================================================
 section "Installing Certbot"
 
-apt-get install -y -qq certbot python3-certbot-apache
+snap install --classic certbot
+ln -s /snap/bin/certbot /usr/local/bin/certbot
 success "Certbot installed"
 info "To enable SSL later, run:"
 echo -e "  ${BOLD}sudo certbot --apache -d ${DOMAIN}${NC}"
@@ -548,153 +545,9 @@ if ! command -v ab &>/dev/null; then
   info "Installing apache2-utils for Apache Bench..."
   apt-get install -y -qq apache2-utils
 fi
- 
-SERVER_IP=$(hostname -I | awk '{print $1}')
-BENCH_URL="http://127.0.0.1/"
- 
-# Scale concurrency and requests to the server size
-if   [[ $PHP_MAX_CHILDREN -le 25 ]];  then
-  AB_REQUESTS=2000;  AB_CONCURRENCY=20
-elif [[ $PHP_MAX_CHILDREN -le 50 ]];  then
-  AB_REQUESTS=5000;  AB_CONCURRENCY=50
-elif [[ $PHP_MAX_CHILDREN -le 100 ]]; then
-  AB_REQUESTS=10000; AB_CONCURRENCY=100
-elif [[ $PHP_MAX_CHILDREN -le 150 ]]; then
-  AB_REQUESTS=15000; AB_CONCURRENCY=150
-else
-  AB_REQUESTS=20000; AB_CONCURRENCY=200
-fi
- 
-# ── Test 1: Static HTML (Apache raw throughput) ───────────────────────────────
-info "Creating static benchmark page..."
-cat > /var/www/html/bench-static.html <<'BENCHEOF'
-<!DOCTYPE html><html><body><h1>benchmark</h1></body></html>
-BENCHEOF
- 
-# Temporarily allow access to /var/www/html for the static test
-cat > /etc/apache2/sites-available/bench-temp.conf <<'APACHEEOF'
-<VirtualHost *:80>
-    DocumentRoot /var/www/html
-    <Directory /var/www/html>
-        Require all granted
-    </Directory>
-</VirtualHost>
-APACHEEOF
-a2ensite bench-temp.conf > /dev/null 2>&1
-systemctl reload apache2
- 
-echo ""
-echo -e "${BOLD}  Test 1/3 — Static HTML (Apache raw throughput)${NC}"
-echo -e "  ${YELLOW}${AB_REQUESTS} requests · ${AB_CONCURRENCY} concurrent · keep-alive${NC}"
-echo ""
- 
-AB_STATIC=$(ab -n "${AB_REQUESTS}" -c "${AB_CONCURRENCY}" -k \
-  "http://127.0.0.1/bench-static.html" 2>&1)
- 
-STATIC_RPS=$(echo "$AB_STATIC"   | grep "Requests per second" | awk '{print $4}')
-STATIC_MEAN=$(echo "$AB_STATIC"  | grep "Time per request"    | head -1 | awk '{print $4}')
-STATIC_P99=$(echo "$AB_STATIC"   | grep " 99%" | awk '{print $2}')
-STATIC_FAIL=$(echo "$AB_STATIC"  | grep "Failed requests"     | awk '{print $3}')
- 
-echo -e "    Requests/sec  : ${GREEN}${STATIC_RPS}${NC}"
-echo -e "    Mean latency  : ${STATIC_MEAN} ms"
-echo -e "    p99 latency   : ${STATIC_P99} ms"
-echo -e "    Failed        : ${STATIC_FAIL}"
- 
-# ── Test 2: PHP via FPM (OPcache throughput) ─────────────────────────────────
-info "Creating PHP benchmark page..."
-cat > "${DOC_ROOT}/bench-php.php" <<'PHPEOF'
-<?php
-// Lightweight PHP benchmark — exercises OPcache + FPM round-trip
-$data = [];
-for ($i = 0; $i < 100; $i++) {
-    $data[] = md5(uniqid('', true));
-}
-$json = json_encode(['status' => 'ok', 'count' => count($data), 'ts' => microtime(true)]);
-header('Content-Type: application/json');
-header('Content-Length: ' . strlen($json));
-echo $json;
-PHPEOF
-chown www-data:www-data "${DOC_ROOT}/bench-php.php"
- 
-# Wait a moment for OPcache to warm up
-sleep 2
- 
-echo ""
-echo -e "${BOLD}  Test 2/3 — PHP-FPM + OPcache (application throughput)${NC}"
-echo -e "  ${YELLOW}${AB_REQUESTS} requests · ${AB_CONCURRENCY} concurrent · keep-alive${NC}"
-echo ""
- 
-AB_PHP=$(ab -n "${AB_REQUESTS}" -c "${AB_CONCURRENCY}" -k \
-  "http://127.0.0.1/bench-php.php" 2>&1)
- 
-PHP_RPS=$(echo "$AB_PHP"   | grep "Requests per second" | awk '{print $4}')
-PHP_MEAN=$(echo "$AB_PHP"  | grep "Time per request"    | head -1 | awk '{print $4}')
-PHP_P99=$(echo "$AB_PHP"   | grep " 99%" | awk '{print $2}')
-PHP_FAIL=$(echo "$AB_PHP"  | grep "Failed requests"     | awk '{print $3}')
-PHP_TPUT=$(echo "$AB_PHP"  | grep "Transfer rate"       | awk '{print $3}')
- 
-echo -e "    Requests/sec  : ${GREEN}${PHP_RPS}${NC}"
-echo -e "    Mean latency  : ${PHP_MEAN} ms"
-echo -e "    p99 latency   : ${PHP_P99} ms"
-echo -e "    Throughput    : ${PHP_TPUT} KB/s"
-echo -e "    Failed        : ${PHP_FAIL}"
- 
-# ── Test 3: Redis ping (cache layer latency) ──────────────────────────────────
-echo ""
-echo -e "${BOLD}  Test 3/3 — Redis latency (cache round-trip)${NC}"
-echo ""
- 
-# Run redis-benchmark: 100k requests, pipeline 16, only PING + SET + GET
-REDIS_BENCH=$(redis-benchmark -q -n 100000 -P 16 -t ping,set,get 2>&1)
- 
-REDIS_PING=$(echo "$REDIS_BENCH" | grep "PING_INLINE" | awk '{print $2}')
-REDIS_SET=$(echo "$REDIS_BENCH"  | grep "^SET"        | awk '{print $2}')
-REDIS_GET=$(echo "$REDIS_BENCH"  | grep "^GET"        | awk '{print $2}')
- 
-echo -e "    PING          : ${GREEN}${REDIS_PING}${NC} req/s"
-echo -e "    SET           : ${GREEN}${REDIS_SET}${NC} req/s"
-echo -e "    GET           : ${GREEN}${REDIS_GET}${NC} req/s"
- 
-# ── Cleanup temp bench files ──────────────────────────────────────────────────
-a2dissite bench-temp.conf > /dev/null 2>&1
-rm -f /etc/apache2/sites-available/bench-temp.conf
-rm -f /var/www/html/bench-static.html
-rm -f "${DOC_ROOT}/bench-php.php"
-systemctl reload apache2
- 
-# ── Worker memory snapshot ────────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}  Worker memory after benchmark:${NC}"
-ps --no-headers -o rss -C php-fpm8.3 2>/dev/null \
-  | awk '{sum+=$1;n++} END {
-      if (n>0) printf "    FPM workers: %d active  |  avg %.1f MB  |  total %.0f MB\n", n, sum/n/1024, sum/1024
-      else print "    No FPM workers found"
-    }'
-free -h | grep Mem \
-  | awk '{printf "    RAM usage  : used %s  |  free %s  |  available %s\n", $3, $4, $7}'
- 
-# ── Grading ───────────────────────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}  Score:${NC}"
- 
-PHP_RPS_INT=$(echo "$PHP_RPS" | cut -d'.' -f1)
-PHP_FAIL_INT=$(echo "$PHP_FAIL" | tr -d ',' | xargs)
- 
-if   [[ "${PHP_RPS_INT:-0}" -ge 5000 ]] && [[ "${PHP_FAIL_INT:-1}" -eq 0 ]]; then
-  echo -e "    ${GREEN}EXCELLENT${NC} — server is performing at full capacity"
-elif [[ "${PHP_RPS_INT:-0}" -ge 2000 ]] && [[ "${PHP_FAIL_INT:-1}" -eq 0 ]]; then
-  echo -e "    ${GREEN}GOOD${NC} — solid performance for this hardware tier"
-elif [[ "${PHP_RPS_INT:-0}" -ge 500 ]]; then
-  echo -e "    ${YELLOW}MODERATE${NC} — acceptable, review FPM pool and OPcache settings"
-else
-  echo -e "    ${RED}LOW${NC} — check error log: tail -30 /var/log/apache2/error.log"
-fi
- 
-if [[ "${PHP_FAIL_INT:-0}" -gt 0 ]]; then
-  warn "Failed requests detected (${PHP_FAIL_INT}) — check FPM pool size and error logs"
-fi
- 
+
+ab -n 1000 -c 50 http://127.0.0.1/
+
 
 # =============================================================================
 #  DONE
