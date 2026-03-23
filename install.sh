@@ -429,15 +429,17 @@ echo -e "  ${BOLD}sudo certbot --apache -d ${DOMAIN}${NC}"
 #  STEP 10 — Webmin
 # =============================================================================
 section "Installing Webmin"
+if dpkg -l | grep -qw webmin; then
+  info "Webmin is already installed, skipping"
+else
+  curl -o webmin-setup-repo.sh https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh
+  sudo sh webmin-setup-repo.sh
 
-curl -o webmin-setup-repo.sh https://raw.githubusercontent.com/webmin/webmin/master/webmin-setup-repo.sh
-sudo sh webmin-setup-repo.sh
+  apt-get update -qq
+  apt-get install -y -qq webmin usermin
 
-
-apt-get update -qq
-apt-get install -y -qq webmin usermin
-
-success "Webmin installed — accessible at https://$(hostname -I | awk '{print $1}'):10000"
+  success "Webmin installed — accessible at https://$(hostname -I | awk '{print $1}'):10000"
+fi
 
 # =============================================================================
 #  STEP 11 — Kernel tuning
