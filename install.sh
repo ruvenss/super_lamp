@@ -413,10 +413,10 @@ a2dissite 000-default.conf 2>/dev/null || true
 success "VirtualHost created at /etc/apache2/sites-available/${DOMAIN}.conf"
 
 # =============================================================================
-#  STEP 9 — Certbot
+#  STEP 9 — Certbot and snapd
 # =============================================================================
 section "Installing Certbot"
-
+apt install -y -qq snapd
 snap install --classic certbot
 if [[ ! -e /usr/local/bin/certbot ]]; then
   ln -s /snap/bin/certbot /usr/local/bin/certbot
