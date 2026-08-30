@@ -245,7 +245,27 @@ success "MPM Event configured"
 #  STEP 6 — PHP 8.3-FPM
 # =============================================================================
 section "Installing PHP 8.3-FPM"
+apt install -y ca-certificates curl
+curl -fsSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg
+. /etc/os-release
+ARCH="$(dpkg --print-architecture)"
 
+case "$VERSION_CODENAME:$ARCH" in
+  resolute:amd64|resolute:arm64|noble:amd64|noble:arm64|noble:armhf|jammy:amd64|jammy:arm64|jammy:armhf)
+    printf '%s\n' \
+      'Types: deb' \
+      'URIs: https://packages.sury.org/php/' \
+      "Suites: $VERSION_CODENAME" \
+      'Components: main' \
+      "Architectures: $ARCH" \
+      'Signed-By: /usr/share/keyrings/deb.sury.org-php.gpg' | sudo tee /etc/apt/sources.list.d/php.sources > /dev/null
+    ;;
+  *)
+    printf 'This PHP 8.3 workflow covers Ubuntu 26.04 on amd64/arm64 and Ubuntu 24.04/22.04 on amd64/arm64/armhf; this host reports %s/%s.\n' "$VERSION_CODENAME" "$ARCH" >&2
+    false
+    ;;
+esac
+apt update
 apt-get install -y -qq \
   php8.3-fpm \
   php8.3-cli \
