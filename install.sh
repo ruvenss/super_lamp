@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
-#  LAMP Stack Auto-Installer for Ubuntu 24.04
-#  Installs: Apache2 (MPM Event) + PHP 8.3-FPM + Redis + Certbot +
+#  LAMP Stack Auto-Installer for Ubuntu 26.04
+#  Installs: Apache2 (MPM Event) + PHP 8.4-FPM (CodeIgniter 4 ready) +
+#            2x Redis (app cache :6379 + PHP sessions :6380) + Certbot +
 #            Webmin + Midnight Commander + ncdu + ImageMagick
 #  Config is calculated automatically from detected CPU and RAM
 #  Author: Ruvenss G Wilches: <ruvenss@gmail.com>
@@ -33,10 +34,16 @@ if [[ $EUID -ne 0 ]]; then
   error "This script must be run as root. Use: sudo bash $0"
 fi
 
-# ─── Ubuntu 24.04 check ──────────────────────────────────────────────────────
-if ! grep -q "24.04" /etc/os-release 2>/dev/null; then
-  warn "This script was designed for Ubuntu 24.04. Proceeding anyway..."
+# ─── Ubuntu 26.04 check ──────────────────────────────────────────────────────
+if ! grep -q "26.04" /etc/os-release 2>/dev/null; then
+  warn "This script was designed for Ubuntu 26.04. Proceeding anyway..."
 fi
+
+# ─── Versions / ports ────────────────────────────────────────────────────────
+# PHP 8.4 is the newest version officially supported by CodeIgniter 4.6
+PHP_V="8.4"
+REDIS_CACHE_PORT=6379     # app / code cache — safe to flush on every deploy
+REDIS_SESSION_PORT=6380   # PHP sessions — persistent, never flushed on deploy
 
 # =============================================================================
 #  STEP 1 — Detect hardware and calculate config values
@@ -62,6 +69,7 @@ if   [[ $RAM_GB -le 2 ]];  then
   OPCACHE_JIT_BUF="32M"
   OPCACHE_MAX_FILES=10000
   REDIS_MAX="128mb"
+  REDIS_SESSION_MAX="64mb"
   APACHE_MAX_WORKERS=25
   HUGEPAGES=32
   REDIS_IO_THREADS=1
@@ -72,6 +80,7 @@ elif [[ $RAM_GB -le 4 ]];  then
   OPCACHE_JIT_BUF="64M"
   OPCACHE_MAX_FILES=20000
   REDIS_MAX="256mb"
+  REDIS_SESSION_MAX="128mb"
   APACHE_MAX_WORKERS=50
   HUGEPAGES=64
   REDIS_IO_THREADS=1
@@ -82,6 +91,7 @@ elif [[ $RAM_GB -le 8 ]];  then
   OPCACHE_JIT_BUF="128M"
   OPCACHE_MAX_FILES=30000
   REDIS_MAX="512mb"
+  REDIS_SESSION_MAX="256mb"
   APACHE_MAX_WORKERS=100
   HUGEPAGES=128
   REDIS_IO_THREADS=2
@@ -92,6 +102,7 @@ elif [[ $RAM_GB -le 16 ]]; then
   OPCACHE_JIT_BUF="128M"
   OPCACHE_MAX_FILES=60000
   REDIS_MAX="1gb"
+  REDIS_SESSION_MAX="512mb"
   APACHE_MAX_WORKERS=200
   HUGEPAGES=256
   REDIS_IO_THREADS=4
@@ -102,6 +113,7 @@ elif [[ $RAM_GB -le 24 ]]; then
   OPCACHE_JIT_BUF="256M"
   OPCACHE_MAX_FILES=100000
   REDIS_MAX="2gb"
+  REDIS_SESSION_MAX="768mb"
   APACHE_MAX_WORKERS=300
   HUGEPAGES=384
   REDIS_IO_THREADS=6
@@ -112,6 +124,7 @@ else
   OPCACHE_JIT_BUF="256M"
   OPCACHE_MAX_FILES=100000
   REDIS_MAX="4gb"
+  REDIS_SESSION_MAX="1gb"
   APACHE_MAX_WORKERS=400
   HUGEPAGES=512
   REDIS_IO_THREADS=8
@@ -154,7 +167,8 @@ echo "  PHP-FPM  start_servers  = ${PHP_START_SERVERS}"
 echo "  PHP      memory_limit   = ${PHP_MEMORY_LIMIT}"
 echo "  OPcache  memory         = ${OPCACHE_MEM} MB"
 echo "  OPcache  JIT buffer     = ${OPCACHE_JIT_BUF}"
-echo "  Redis    maxmemory      = ${REDIS_MAX}"
+echo "  Redis    cache maxmem   = ${REDIS_MAX} (port ${REDIS_CACHE_PORT})"
+echo "  Redis    session maxmem = ${REDIS_SESSION_MAX} (port ${REDIS_SESSION_PORT})"
 echo "  Apache   MaxRequestWorkers = ${APACHE_MAX_WORKERS}"
 echo "  Apache   StartServers   = ${APACHE_START_SERVERS}"
 echo "  Hugepages               = ${HUGEPAGES}"
@@ -172,11 +186,13 @@ if [[ -z "$DOMAIN" ]]; then
   error "Domain name cannot be empty."
 fi
 
-# Document root under /home/<domain>
+# Project root under /home/<domain>; CodeIgniter 4 serves from <root>/public
 DOC_ROOT="/home/${DOMAIN}"
+WEB_ROOT="${DOC_ROOT}/public"
 
 info "Domain    : ${DOMAIN}"
 info "Doc root  : ${DOC_ROOT}"
+info "Web root  : ${WEB_ROOT}"
 
 # =============================================================================
 #  STEP 3 — System update
@@ -196,8 +212,8 @@ apt-get install -y -qq \
   mc ncdu htop iotop \
   imagemagick \
   software-properties-common \
-  apt-transport-https \
-  gnupg2 lsb-release \
+  ca-certificates \
+  gnupg lsb-release \
   ufw fail2ban
 
 success "Utilities installed"
@@ -210,7 +226,9 @@ section "Installing Apache2"
 apt-get install -y -qq apache2
 
 # Disable mod_php and prefork if present
-a2dismod php8.3   2>/dev/null || true
+for mod in /etc/apache2/mods-enabled/php*.load; do
+  [[ -e "$mod" ]] && a2dismod "$(basename "$mod" .load)" || true
+done
 a2dismod mpm_prefork 2>/dev/null || true
 
 # Enable required modules
@@ -242,10 +260,9 @@ EOF
 success "MPM Event configured"
 
 # =============================================================================
-#  STEP 6 — PHP 8.3-FPM
+#  STEP 6 — PHP 8.4-FPM (CodeIgniter 4 compatible)
 # =============================================================================
-section "Installing PHP 8.3-FPM"
-apt install -y ca-certificates curl
+section "Installing PHP ${PHP_V}-FPM"
 curl -fsSLo /usr/share/keyrings/deb.sury.org-php.gpg https://packages.sury.org/php/apt.gpg
 . /etc/os-release
 ARCH="$(dpkg --print-architecture)"
@@ -258,41 +275,48 @@ case "$VERSION_CODENAME:$ARCH" in
       "Suites: $VERSION_CODENAME" \
       'Components: main' \
       "Architectures: $ARCH" \
-      'Signed-By: /usr/share/keyrings/deb.sury.org-php.gpg' | sudo tee /etc/apt/sources.list.d/php.sources > /dev/null
+      'Signed-By: /usr/share/keyrings/deb.sury.org-php.gpg' | tee /etc/apt/sources.list.d/php.sources > /dev/null
     ;;
   *)
-    printf 'This PHP 8.3 workflow covers Ubuntu 26.04 on amd64/arm64 and Ubuntu 24.04/22.04 on amd64/arm64/armhf; this host reports %s/%s.\n' "$VERSION_CODENAME" "$ARCH" >&2
+    printf 'This PHP 8.4 workflow covers Ubuntu 26.04 on amd64/arm64 and Ubuntu 24.04/22.04 on amd64/arm64/armhf; this host reports %s/%s.\n' "$VERSION_CODENAME" "$ARCH" >&2
     false
     ;;
 esac
-apt update
+apt-get update -qq
+# intl + mbstring + mysql (mysqlnd) + curl are required by CodeIgniter 4;
+# redis powers CI's RedisHandler (cache + sessions)
 apt-get install -y -qq \
-  php8.3-fpm \
-  php8.3-cli \
-  php8.3-common \
-  php8.3-mysql \
-  php8.3-redis \
-  php8.3-mbstring \
-  php8.3-xml \
-  php8.3-curl \
-  php8.3-zip \
-  php8.3-intl \
-  php8.3-gd \
-  php8.3-imagick \
-  php8.3-bcmath \
-  php8.3-soap
+  php${PHP_V}-fpm \
+  php${PHP_V}-cli \
+  php${PHP_V}-common \
+  php${PHP_V}-mysql \
+  php${PHP_V}-sqlite3 \
+  php${PHP_V}-redis \
+  php${PHP_V}-mbstring \
+  php${PHP_V}-xml \
+  php${PHP_V}-curl \
+  php${PHP_V}-zip \
+  php${PHP_V}-intl \
+  php${PHP_V}-gd \
+  php${PHP_V}-imagick \
+  php${PHP_V}-bcmath \
+  php${PHP_V}-soap
 
-a2enconf php8.3-fpm
-success "PHP 8.3-FPM installed"
+# Make sure the CLI (spark, composer) uses the same PHP as FPM
+update-alternatives --set php "/usr/bin/php${PHP_V}" 2>/dev/null || true
+
+# Composer — needed to install / update CodeIgniter 4 projects
+if ! command -v composer &>/dev/null; then
+  curl -fsSL https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+fi
+
+a2enconf "php${PHP_V}-fpm"
+success "PHP ${PHP_V}-FPM installed"
 
 # ── FPM pool config ───────────────────────────────────────────────────────────
 info "Writing PHP-FPM pool config..."
 
-# Detect actual socket path
-FPM_SOCK=$(php8.3-fpm -t 2>&1 | grep -oP '/run/php/[^\s]+\.sock' | head -1 || true)
-[[ -z "$FPM_SOCK" ]] && FPM_SOCK="/run/php/php-fpm.sock"
-
-cat > /etc/php/8.3/fpm/pool.d/www.conf <<EOF
+cat > /etc/php/${PHP_V}/fpm/pool.d/www.conf <<EOF
 [www]
 user = www-data
 group = www-data
@@ -311,13 +335,13 @@ pm.max_spare_servers = ${PHP_MAX_SPARE}
 pm.max_requests = 1000
 
 request_slowlog_timeout = 3s
-slowlog = /var/log/php8.3-fpm-slow.log
+slowlog = /var/log/php${PHP_V}-fpm-slow.log
 
 php_admin_value[memory_limit] = ${PHP_MEMORY_LIMIT}
 php_admin_value[max_execution_time] = 30
 php_admin_value[upload_max_filesize] = 64M
 php_admin_value[post_max_size] = 64M
-php_admin_value[error_log] = /var/log/php8.3-fpm-error.log
+php_admin_value[error_log] = /var/log/php${PHP_V}-fpm-error.log
 php_flag[display_errors] = off
 EOF
 
@@ -326,7 +350,7 @@ success "PHP-FPM pool configured"
 # ── OPcache + JIT ────────────────────────────────────────────────────────────
 info "Writing OPcache + JIT config..."
 
-cat > /etc/php/8.3/fpm/conf.d/99-perf.ini <<EOF
+cat > /etc/php/${PHP_V}/fpm/conf.d/99-perf.ini <<EOF
 ; OPcache
 opcache.enable = 1
 opcache.memory_consumption = ${OPCACHE_MEM}
@@ -348,23 +372,36 @@ realpath_cache_ttl = 600
 ; General
 memory_limit = ${PHP_MEMORY_LIMIT}
 max_execution_time = 30
+
+; Native PHP sessions -> dedicated sessions Redis (survives cache flushes)
+; CodeIgniter 4 uses its own Session config — see the notes at the end.
+session.save_handler = redis
+session.save_path = "tcp://127.0.0.1:${REDIS_SESSION_PORT}"
+redis.session.locking_enabled = 1
 EOF
 
 success "OPcache + JIT configured"
 
 # =============================================================================
-#  STEP 7 — Redis
+#  STEP 7 — Redis (two instances)
+#    :6379  redis-server    — app/code cache, LRU, no persistence, flush freely
+#    :6380  redis-sessions  — PHP sessions, persisted to disk, FLUSH disabled
 # =============================================================================
-section "Installing Redis"
+section "Installing Redis (cache + sessions)"
 
-apt-get install -y -qq redis-server
+apt-get install -y -qq redis-server redis-tools
+REDIS_BIN=$(command -v redis-server)
 
+# ── Instance 1: cache ────────────────────────────────────────────────────────
 cat > /etc/redis/redis.conf <<EOF
 bind 127.0.0.1
-port 6379
+port ${REDIS_CACHE_PORT}
+dir /var/lib/redis
+logfile /var/log/redis/redis-server.log
 maxmemory ${REDIS_MAX}
 maxmemory-policy allkeys-lru
 save ""
+appendonly no
 tcp-backlog 511
 tcp-keepalive 300
 io-threads ${REDIS_IO_THREADS}
@@ -372,7 +409,73 @@ io-threads-do-reads yes
 EOF
 
 systemctl enable redis-server
-success "Redis installed and configured (maxmemory: ${REDIS_MAX})"
+success "Redis cache configured on :${REDIS_CACHE_PORT} (maxmemory: ${REDIS_MAX})"
+
+# ── Instance 2: sessions ─────────────────────────────────────────────────────
+mkdir -p /var/lib/redis-sessions
+chown redis:redis /var/lib/redis-sessions
+chmod 750 /var/lib/redis-sessions
+
+cat > /etc/redis/redis-sessions.conf <<EOF
+bind 127.0.0.1
+port ${REDIS_SESSION_PORT}
+dir /var/lib/redis-sessions
+logfile /var/log/redis/redis-sessions.log
+maxmemory ${REDIS_SESSION_MAX}
+# Sessions always carry a TTL: under pressure drop the ones closest to expiry
+maxmemory-policy volatile-ttl
+
+# Persist so users stay logged in across Redis restarts / reboots
+appendonly yes
+appendfilename "sessions.aof"
+appendfsync everysec
+dbfilename sessions.rdb
+save 3600 1 300 100 60 10000
+
+# Guard against an accidental flush wiping every logged-in user
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+
+tcp-backlog 511
+tcp-keepalive 300
+EOF
+chown redis:redis /etc/redis/redis-sessions.conf
+chmod 640 /etc/redis/redis-sessions.conf
+
+cat > /etc/systemd/system/redis-sessions.service <<EOF
+[Unit]
+Description=Redis — PHP session store (port ${REDIS_SESSION_PORT})
+After=network.target
+
+[Service]
+Type=notify
+User=redis
+Group=redis
+ExecStart=${REDIS_BIN} /etc/redis/redis-sessions.conf --supervised systemd --daemonize no
+Restart=always
+RestartSec=2
+LimitNOFILE=65535
+RuntimeDirectory=redis-sessions
+RuntimeDirectoryMode=2755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable redis-sessions
+success "Redis sessions configured on :${REDIS_SESSION_PORT} (maxmemory: ${REDIS_SESSION_MAX}, persistent)"
+
+# ── Deploy helper: refresh code cache without touching sessions ──────────────
+cat > /usr/local/bin/refresh-code-cache <<EOF
+#!/bin/bash
+# Flush the app/code cache Redis and OPcache. Sessions (:${REDIS_SESSION_PORT}) are untouched.
+set -e
+redis-cli -p ${REDIS_CACHE_PORT} FLUSHALL
+systemctl reload php${PHP_V}-fpm
+echo "Code cache + OPcache flushed — user sessions kept."
+EOF
+chmod 755 /usr/local/bin/refresh-code-cache
 
 # =============================================================================
 #  STEP 8 — Document root and VirtualHost
@@ -381,9 +484,12 @@ section "Creating VirtualHost for ${DOMAIN}"
 
 # Only create doc root and set permissions if it doesn't exist
 if [[ ! -d "${DOC_ROOT}" ]]; then
-  mkdir -p "${DOC_ROOT}"
+  mkdir -p "${WEB_ROOT}"
   chown -R www-data:www-data "${DOC_ROOT}"
-  chmod 750 "${DOC_ROOT}" 
+  chmod 750 "${DOC_ROOT}"
+elif [[ ! -d "${WEB_ROOT}" ]]; then
+  mkdir -p "${WEB_ROOT}"
+  chown www-data:www-data "${WEB_ROOT}"
 fi
 
 
@@ -392,9 +498,9 @@ cat > "/etc/apache2/sites-available/${DOMAIN}.conf" <<EOF
 <VirtualHost *:80>
     ServerName ${DOMAIN}
     ServerAlias www.${DOMAIN}
-    DocumentRoot ${DOC_ROOT}
+    DocumentRoot ${WEB_ROOT}
 
-    <Directory ${DOC_ROOT}>
+    <Directory ${WEB_ROOT}>
         Options -Indexes +FollowSymLinks
         AllowOverride All
         Require all granted
@@ -477,6 +583,8 @@ net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 fs.file-max = 1000000
 vm.nr_hugepages = ${HUGEPAGES}
+# Lets the sessions Redis fork for background saves without failing
+vm.overcommit_memory = 1
 EOF
 
 sysctl -p /etc/sysctl.d/99-webserver.conf > /dev/null
@@ -506,15 +614,15 @@ fi
 # =============================================================================
 #  STEP 13 — Log rotation for slow log
 # =============================================================================
-cat > /etc/logrotate.d/php8.3-fpm-slow <<EOF
-/var/log/php8.3-fpm-slow.log {
+cat > /etc/logrotate.d/php${PHP_V}-fpm-slow <<EOF
+/var/log/php${PHP_V}-fpm-slow.log {
     daily
     rotate 14
     compress
     missingok
     notifempty
     postrotate
-        /usr/lib/php/php8.3-fpm-reopenlogs
+        /usr/lib/php/php${PHP_V}-fpm-reopenlogs
     endscript
 }
 EOF
@@ -524,9 +632,10 @@ EOF
 # =============================================================================
 section "Starting services"
 
-systemctl enable php8.3-fpm apache2 redis-server
+systemctl enable "php${PHP_V}-fpm" apache2 redis-server redis-sessions
 systemctl restart redis-server
-systemctl restart php8.3-fpm
+systemctl restart redis-sessions
+systemctl restart "php${PHP_V}-fpm"
 systemctl restart apache2
 
 # Verify
@@ -538,13 +647,15 @@ apache2ctl configtest && success "Apache config syntax OK" || error "Apache conf
 section "Health check"
 
 echo ""
-PHP_VER=$(php -r "echo PHP_VERSION;")
+PHP_VERSION_STR=$(php -r "echo PHP_VERSION;")
 APACHE_VER=$(apache2 -v | grep version | awk '{print $3}')
 REDIS_VER=$(redis-server --version | awk '{print $3}')
 
-echo -e "  ${GREEN}PHP${NC}     : ${PHP_VER}"
+echo -e "  ${GREEN}PHP${NC}     : ${PHP_VERSION_STR}"
 echo -e "  ${GREEN}Apache${NC}  : ${APACHE_VER}"
 echo -e "  ${GREEN}Redis${NC}   : ${REDIS_VER}"
+echo -e "  ${GREEN}Cache${NC}   : :${REDIS_CACHE_PORT} $(redis-cli -p ${REDIS_CACHE_PORT} ping 2>/dev/null || echo 'DOWN!')"
+echo -e "  ${GREEN}Sessions${NC}: :${REDIS_SESSION_PORT} $(redis-cli -p ${REDIS_SESSION_PORT} ping 2>/dev/null || echo 'DOWN!')"
 echo -e "  ${GREEN}OPcache${NC} : $(php -r "echo opcache_get_status() ? 'enabled' : 'disabled';" 2>/dev/null || echo 'check manually')"
 echo ""
 echo -e "  ${GREEN}MPM${NC}     : $(apache2ctl -V 2>/dev/null | grep MPM | awk '{print $3}')"
@@ -555,7 +666,8 @@ echo ""
 echo -e "  ${BOLD}RAM budget:${NC}"
 echo -e "    FPM workers  : ${PHP_MAX_CHILDREN} × 40 MB = $(( PHP_MAX_CHILDREN * 40 )) MB"
 echo -e "    OPcache      : ${OPCACHE_MEM} MB"
-echo -e "    Redis        : ${REDIS_MAX}"
+echo -e "    Redis cache  : ${REDIS_MAX}"
+echo -e "    Redis session: ${REDIS_SESSION_MAX}"
 echo -e "    Sessions     : ${SESSION_TMPFS} (tmpfs)"
 free -h | grep Mem | awk '{printf "    Total RAM    : %s  |  Used: %s  |  Free: %s\n", $2, $3, $4}'
 
@@ -584,15 +696,22 @@ echo ""
 echo -e "  ${BOLD}Your server is ready.${NC}"
 echo ""
 echo -e "  Site URL     : ${CYAN}http://${DOMAIN}${NC}"
-echo -e "  Doc root     : ${CYAN}${DOC_ROOT}${NC}"
+echo -e "  Doc root     : ${CYAN}${DOC_ROOT}${NC}  (web root: ${WEB_ROOT})"
 echo -e "  Webmin       : ${CYAN}https://${SERVER_IP}:10000${NC}"
 echo ""
 echo -e "  ${BOLD}To enable SSL (HTTPS) when DNS is pointing to this server:${NC}"
 echo -e "  ${YELLOW}sudo certbot --apache -d ${DOMAIN} -d www.${DOMAIN}${NC}"
 echo ""
-echo -e "  ${BOLD}To deploy new code without cache issues:${NC}"
-echo -e "  ${YELLOW}sudo systemctl reload php8.3-fpm${NC}"
+echo -e "  ${BOLD}To deploy new code (flushes cache Redis + OPcache, keeps sessions):${NC}"
+echo -e "  ${YELLOW}sudo refresh-code-cache${NC}"
+echo ""
+echo -e "  ${BOLD}CodeIgniter 4 — add to your project's .env:${NC}"
+echo -e "  ${YELLOW}cache.handler = redis${NC}"
+echo -e "  ${YELLOW}cache.redis.host = 127.0.0.1${NC}"
+echo -e "  ${YELLOW}cache.redis.port = ${REDIS_CACHE_PORT}${NC}"
+echo -e "  ${YELLOW}session.driver = 'CodeIgniter\\Session\\Handlers\\RedisHandler'${NC}"
+echo -e "  ${YELLOW}session.savePath = 'tcp://127.0.0.1:${REDIS_SESSION_PORT}'${NC}"
 echo ""
 echo -e "  ${BOLD}Monitor workers:${NC}"
-echo -e "  ${YELLOW}ps --no-headers -o rss -C php-fpm8.3 | awk '{sum+=\$1;n++} END {printf \"workers: %d  avg: %.1fMB  total: %.0fMB\\n\",n,sum/n/1024,sum/1024}'${NC}"
+echo -e "  ${YELLOW}ps --no-headers -o rss -C php-fpm${PHP_V} | awk '{sum+=\$1;n++} END {printf \"workers: %d  avg: %.1fMB  total: %.0fMB\\n\",n,sum/n/1024,sum/1024}'${NC}"
 echo ""

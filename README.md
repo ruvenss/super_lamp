@@ -1,6 +1,6 @@
 # LAMP Stack Auto-Installer
 
-> High-performance PHP server setup for Ubuntu 24.04 — fully automated, hardware-aware, production-ready.
+> High-performance PHP server setup for Ubuntu 26.04 — CodeIgniter 4 ready — fully automated, hardware-aware, production-ready.
 
 ---
 
@@ -17,9 +17,11 @@ When the script finishes, it runs a three-stage performance benchmark and shows 
 | Component | Version | Role |
 |---|---|---|
 | **Apache2** | 2.4.x | Web server (MPM Event) |
-| **PHP-FPM** | 8.3 | FastCGI process manager |
+| **PHP-FPM** | 8.4 | FastCGI process manager (CodeIgniter 4.6 compatible) |
+| **Composer** | latest | PHP dependency manager (CodeIgniter install/update) |
 | **OPcache + JIT** | built-in | Bytecode + JIT compilation |
-| **Redis** | 7.x | Object cache + session store |
+| **Redis — cache** | distro | App / code cache on `:6379` (flushed on deploy) |
+| **Redis — sessions** | distro | PHP session store on `:6380` (persistent, never flushed) |
 | **Certbot** | latest | SSL certificate management |
 | **Webmin** | latest | Server administration UI |
 | **ImageMagick** | latest | Image processing |
@@ -30,7 +32,7 @@ When the script finishes, it runs a three-stage performance benchmark and shows 
 
 ## Requirements
 
-- Ubuntu **24.04 LTS**
+- Ubuntu **26.04 LTS**
 - Root or sudo access
 - A domain name pointed at the server (for SSL — optional at install time)
 - Outbound internet access
@@ -68,7 +70,8 @@ Detected: 8 vCPU | 16 GB RAM | 160 GB disk
   PHP      memory_limit      = 256M
   OPcache  memory            = 384 MB
   OPcache  JIT buffer        = 128M
-  Redis    maxmemory         = 1gb
+  Redis    cache maxmem      = 1gb (port 6379)
+  Redis    session maxmem    = 512mb (port 6380)
   Apache   MaxRequestWorkers = 200
   Apache   StartServers      = 8
   Hugepages                  = 256
@@ -83,7 +86,8 @@ Detected: 8 vCPU | 16 GB RAM | 160 GB disk
 | `memory_limit` | 128M | 256M | 256M | 256M | 256M |
 | `opcache.memory_consumption` | 128 MB | 256 MB | 384 MB | 512 MB | 512 MB |
 | `opcache.jit_buffer_size` | 64M | 128M | 128M | 256M | 256M |
-| `maxmemory` Redis | 256mb | 512mb | 1gb | 2gb | 4gb |
+| `maxmemory` Redis cache | 256mb | 512mb | 1gb | 2gb | 4gb |
+| `maxmemory` Redis sessions | 128mb | 256mb | 512mb | 768mb | 1gb |
 | `MaxRequestWorkers` | 50 | 100 | 200 | 300 | 400 |
 | `StartServers` | 2 | 4 | 8 | 12 | 16 |
 | `nr_hugepages` | 64 | 128 | 256 | 384 | 512 |
@@ -103,8 +107,8 @@ The script runs 17 steps and reports progress at each one:
   Step 3  — System update
   Step 4  — Installing utilities
   Step 5  — Installing Apache2
-  Step 6  — Installing PHP 8.3-FPM
-  Step 7  — Installing Redis
+  Step 6  — Installing PHP 8.4-FPM + Composer
+  Step 7  — Installing Redis (cache + sessions)
   Step 8  — Creating VirtualHost
   Step 9  — Installing Certbot
   Step 10 — Installing Webmin
@@ -172,19 +176,66 @@ Sample output:
 
 ---
 
+## Two Redis servers
+
+Redis runs as two independent instances so that deploying new code never logs your users out:
+
+| Instance | Service | Port | Holds | Eviction | Persistence |
+|---|---|---|---|---|---|
+| Cache | `redis-server` | 6379 | App / code cache (CodeIgniter cache) | `allkeys-lru` | none — safe to flush |
+| Sessions | `redis-sessions` | 6380 | PHP / CodeIgniter sessions | `volatile-ttl` | AOF + RDB in `/var/lib/redis-sessions` |
+
+`FLUSHALL` and `FLUSHDB` are disabled on the sessions instance so a stray flush can't wipe every logged-in user.
+
+After deploying new code:
+
+```bash
+sudo refresh-code-cache
+```
+
+This flushes the cache Redis (`:6379`) and reloads PHP-FPM to clear OPcache. The sessions Redis (`:6380`) is left alone.
+
+---
+
+## CodeIgniter 4
+
+PHP 8.4 is installed with every extension CodeIgniter 4 needs (`intl`, `mbstring`, `mysqlnd`, `curl`, `json`, plus `redis`, `gd`, `imagick`, `sqlite3`). Composer is installed globally.
+
+The VirtualHost serves `/home/yourdomain.com/public`, which is CodeIgniter 4's front controller directory. Deploy the project to `/home/yourdomain.com/`:
+
+```bash
+cd /home/yourdomain.com
+sudo -u www-data composer create-project codeigniter4/appstarter .
+```
+
+Point CodeIgniter at the two Redis instances in your project's `.env`:
+
+```ini
+cache.handler = redis
+cache.redis.host = 127.0.0.1
+cache.redis.port = 6379
+
+session.driver = 'CodeIgniter\Session\Handlers\RedisHandler'
+session.savePath = 'tcp://127.0.0.1:6380'
+```
+
+Plain PHP `session_start()` also goes to the sessions Redis, because `session.save_handler = redis` is set in the FPM config.
+
+---
+
 ## VirtualHost
 
 The script creates a port 80 VirtualHost (no SSL). SSL is intentionally left for you to enable afterwards so you control the timing.
 
-Document root is created at `/home/yourdomain.com/`.
+The project root is created at `/home/yourdomain.com/` and the web root at `/home/yourdomain.com/public/`.
 
 ```apache
 <VirtualHost *:80>
     ServerName yourdomain.com
     ServerAlias www.yourdomain.com
-    DocumentRoot /home/yourdomain.com
+    DocumentRoot /home/yourdomain.com/public
 
-    <Directory /home/yourdomain.com>
+    <Directory /home/yourdomain.com/public>
         Options -Indexes +FollowSymLinks
         AllowOverride All
         Require all granted
@@ -232,11 +283,11 @@ UFW is configured automatically:
 
 **Unix socket over TCP** — FPM communicates with Apache via `/run/php/php-fpm.sock` rather than `127.0.0.1:9000`. Eliminates TCP stack overhead for every PHP request.
 
-**OPcache with validate_timestamps = 0** — PHP files are compiled once and cached in shared memory permanently. No filesystem stat calls on every request. Cache is cleared with `sudo systemctl reload php8.3-fpm`.
+**OPcache with validate_timestamps = 0** — PHP files are compiled once and cached in shared memory permanently. No filesystem stat calls on every request. Cache is cleared with `sudo refresh-code-cache` (or `sudo systemctl reload php8.4-fpm`).
 
 **JIT tracing mode** — PHP 8.x JIT compiles hot code paths to native machine code at runtime. The `tracing` mode gives the best results for typical web workloads.
 
-**Redis for sessions** — PHP sessions are stored in Redis instead of disk. Eliminates session file locking bottlenecks under concurrent load.
+**Separate Redis for sessions** — PHP sessions are stored in a dedicated, persistent Redis instance on port 6380, isolated from the app cache on 6379. You can flush the cache on every deploy without logging users out, and sessions survive Redis restarts and reboots.
 
 **tmpfs for session fallback** — Even if Redis is bypassed, `/var/lib/php/sessions` is mounted in RAM so session I/O never hits the SSD.
 
@@ -249,14 +300,14 @@ UFW is configured automatically:
 ### Deploy new code without cache issues
 
 ```bash
-# After uploading new PHP files — clears OPcache gracefully
-sudo systemctl reload php8.3-fpm
+# After uploading new PHP files — flushes cache Redis + OPcache, keeps sessions
+sudo refresh-code-cache
 ```
 
 ### Monitor FPM workers in real time
 
 ```bash
-watch -n2 "ps --no-headers -o rss -C php-fpm8.3 \
+watch -n2 "ps --no-headers -o rss -C php-fpm8.4 \
   | awk '{sum+=\$1;n++} END \
   {printf \"workers: %d  avg: %.1fMB  total: %.0fMB\n\",n,sum/n/1024,sum/1024}'"
 ```
@@ -264,7 +315,7 @@ watch -n2 "ps --no-headers -o rss -C php-fpm8.3 \
 ### Watch for slow DB queries
 
 ```bash
-tail -f /var/log/php8.3-fpm-slow.log
+tail -f /var/log/php8.4-fpm-slow.log
 ```
 
 ### Check memory pressure
@@ -296,23 +347,31 @@ sudo journalctl -xeu apache2.service --no-pager | tail -30
 **PHP-FPM fails to start**
 
 ```bash
-sudo systemctl status php8.3-fpm
-sudo tail -30 /var/log/php8.3-fpm.log
+sudo systemctl status php8.4-fpm
+sudo tail -30 /var/log/php8.4-fpm.log
 # Common cause: opcache.preload pointing to a file that doesn't exist
-# Fix: comment out opcache.preload in /etc/php/8.3/fpm/conf.d/99-perf.ini
+# Fix: comment out opcache.preload in /etc/php/8.4/fpm/conf.d/99-perf.ini
 ```
 
 **503 Service Unavailable**
 
 ```bash
 ls -la /run/php/          # confirm socket exists
-sudo systemctl status php8.3-fpm
+sudo systemctl status php8.4-fpm
 ```
 
 **Old code still running after deploy**
 
 ```bash
-sudo systemctl reload php8.3-fpm    # flushes OPcache
+sudo refresh-code-cache    # flushes cache Redis + OPcache, sessions kept
+```
+
+**Users logged out / sessions not saving**
+
+```bash
+sudo systemctl status redis-sessions
+redis-cli -p 6380 ping          # should reply PONG
+redis-cli -p 6380 dbsize        # number of active sessions
 ```
 
 **403 Forbidden**
